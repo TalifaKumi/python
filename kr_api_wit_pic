@@ -1,0 +1,98 @@
+cat kr_api.py
+import json
+import urllib
+import os
+import http.cookiejar
+import inspect
+import sys
+import time
+sys.path.append("/opt/data/CSVSQL/")
+import csvsql
+
+class Requester:
+        def __init__(self):
+                self.__cookies = http.cookiejar.LWPCookieJar()
+                self.__handlers = [
+                        urllib.request.HTTPHandler(),
+                        urllib.request.HTTPSHandler(),
+                        urllib.request.HTTPCookieProcessor(self.__cookies)
+                ]
+
+                self.__opener = urllib.request.build_opener(*self.__handlers)
+
+        def get(self, url):
+                req = urllib.request.Request(url)
+                # req.add_header('Content-Type', 'application/json')
+                # req.add_header('Authorization', '82SDYDOH1PTGXLQQ')
+                req.get_method = lambda: 'GET'
+
+                result = self.__opener.open(req)
+                return result.read().decode('utf-8')
+
+def log(s):
+        global DEBUG_MODE
+        if DEBUG_MODE:
+                t = time.strftime('%Y-%m-%d %H:%M:%S')
+                a = inspect.stack()[1]
+                f = a[1].split('\\')[-1]
+                if len(s) > 96:
+                        s = s[:93] + '...'
+                print(f'{t} {f}:{a[2]:<3} {a[3]:20} {s}')
+
+def download_imgs(json_dict):
+
+        path = '/opt/data/KR/imgs/'
+        # path = './img/'
+        os.makedirs(path, exist_ok=True)
+
+        count = 0
+        for img in json_dict['images']:
+                urllib.request.urlretrieve('https://dorogi-onf.ru' + urllib.parse.quote(img), path + str(json_dict['id']) + '_' + str(count) + '.jpg')
+                count += 1
+
+def build_csv_row(json_dict):
+        img_path = '/opt/data/KR/imgs/'
+
+        result = (str(json_dict['id']) + '|' +
+                        str(json_dict['address']) + '|' +
+                        str(json_dict['full_address']) + '|' +
+                        str(json_dict['user']) + '|' +
+                        str(json_dict['description']).replace('\r\n', ' ').replace('\n', ' ') + '|' +
+                        str(json_dict['map']) + '|' +
+                        str(json_dict['date']) + '|' +
+                        str(json_dict['condition']) + '|' +
+                        str(json_dict['condition_id']) + '|' +
+                        str(json_dict['category']) + '|' +
+                        str(json_dict['category_id']) + '|' +
+                        str(json_dict['location']) + '|' +
+                        str(json_dict['location_id']) + '|' +
+                        str(json_dict['distance']) + '|' +
+                        str(json_dict['trucker']) + '|' +
+                        str(json_dict['rating']) + '|')
+
+        images_names = []
+        for i in range(len(json_dict['images'])):
+                images_names.append(img_path + str(json_dict['id']) + '_' + str(i) + '.jpg')
+
+        result += ';'.join(images_names)
+
+        return result
+
+DEBUG_MODE = True
+
+URL = 'https://dorogi-onf.ru/api/problems/?format=json&access-token=1VPX1YUMU2267UX3'
+req = Requester()
+offset = 0
+file = open('result.csv', 'w')
+while True:
+        log('offset ' + str(offset))
+        print(req.get(URL + '&limit=300&offset=' + str(offset)))
+        items = json.loads(req.get(URL + '&limit=300&offset=' + str(offset)))["items"]
+        if len(items) == 0:
+                break
+        for item in items:
+                log('item ' + str(item['id']))
+                download_imgs(item)
+                file.write(build_csv_row(item) + '\n')
+        offset += 300
+file.close()
