@@ -1,0 +1,340 @@
+/opt/data/DTP_AVAR/py/multi_dtp.py
+from multiprocessing import Process, Queue
+import time
+import sys
+import urllib
+import re
+import xlrd
+import subprocess
+import http.cookiejar
+import json
+import inspect
+import os
+import datetime
+from bs4 import BeautifulSoup as bs
+
+def log(s):
+        t = time.strftime('%Y-%m-%d %H:%M:%S')
+        a = inspect.stack()[1]
+        f = a[1].split('\\')[-1]
+        if len(s) > 96:
+                s = s[:93] + '...'
+        print(f'{t} {f}:{a[2]:<3} {a[3]:20} {s}')
+
+class Card:
+        def __init__(self, reg, date_st, date_end):
+                self.reg = reg
+                self.date_st = date_st
+                self.date_end = date_end
+                self.pdf_code = str()
+                self.xls_code = str()
+                self.last_retry = 0
+                self.retry_count = 0
+
+        def dump(self):
+                return self.reg + '_' + self.date_st.replace('.','-') + '_' + self.date_end.replace('.','-')
+
+class Requester:
+        def __init__(self):
+                self.__cookies = http.cookiejar.LWPCookieJar()
+                self.__handlers = [
+                        urllib.request.HTTPHandler(),
+                        urllib.request.HTTPSHandler(),
+                        urllib.request.HTTPCookieProcessor(self.__cookies)
+                ]
+
+                self.__opener = urllib.request.build_opener(*self.__handlers)
+
+        def __build_request(self, url, d=None, met=None):
+                if d:
+                        req = urllib.request.Request(url, data=d.encode())
+                else:
+                        req = urllib.request.Request(url)
+                req.add_header('Content-Type', 'application/json; charset=UTF-8')
+                req.add_header('X-Requested-With', 'XMLHttpRequest')
+                req.add_header('Referer', 'http://stat.gibdd.ru/')
+                req.add_header('Origin', 'http://stat.gibdd.ru')
+                req.add_header('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 YaBrowser/18.10.2.172 Yowser/2.5 Safari/537.36')
+                if met:
+                        req.get_method = lambda: met
+                return req
+
+        def get(self, url):
+                req = self.__build_request(url)
+                return self.__opener.open(req).read()
+
+        def post(self, url, d):
+                req = self.__build_request(url, d=d, met='POST')
+                result = self.__opener.open(req)
+                return result.read().decode('utf-8')
+
+def get_codes(req, card):
+        count = 1
+        pdf_url = 'http://stat.gibdd.ru/getCardsPDF'
+        xls_url ='http://stat.gibdd.ru/getCardsXLS'
+        param = '''{"date_st":"''' + card.date_st + '''","date_end":"''' + card.date_end + '''","ParReg":"877","order":{"type":1,"fieldName":"dat"},"reg":["''' + card.reg + '''"],"ind":"1","exportType":1}'''
+
+        data = json.dumps({'data':param})
+
+        while True:
+                try:
+                        pdf_code = json.loads(req.post(pdf_url, data))['data']
+                        xls_code = json.loads(req.post(xls_url, data))['data']
+                        break
+                except urllib.error.HTTPError as err:
+                        # log('HTTPError')
+                        if count > 2:
+                                return 500
+
+                        if err.code == 503:
+                                return 503
+
+                        if err.code == 500:
+                                log('Error ' + str(err.code) + '. Retry ' + str(count))
+                                time.sleep(1)
+                                count += 1
+
+                except urllib.error.URLError as err:
+                        # log('URLError')
+                        return 503
+
+        card.pdf_code = pdf_code
+        card.xls_code = xls_code
+        return card
+
+def download(req, card):
+        count = 1
+        download_url = 'http://stat.gibdd.ru/getPDFbyId?data='
+        while True:
+                try:
+                        for ext, code in zip(['.pdf', '.xls'], [card.pdf_code, card.xls_code]):
+                                archive_name = './dtpdata/raw/' + card.dump() + '_' + str(code) + '.zip'
+                                with open(archive_name, 'wb') as archive:
+                                        archive.write(req.get(download_url + code))
+                                subprocess.check_output(['unzip -p ' + archive_name + ' > ./dtpdata/raw/' + card.dump() + ext], shell=True)
+                                subprocess.check_output(['rm ' + archive_name], shell=True)
+                        return card
+                except urllib.error.HTTPError as err:
+                        if count > 2:
+                                return 500
+
+                        if err.code == 503:
+                                return 503
+
+                        if err.code == 500:
+                                log('Error ' + str(err.code) + '. ' + card.dump() + '. Retry ' + str(count))
+                                time.sleep(1)
+                                count += 1
+
+def reader1(queue1, queue2, queue4):
+        delta = datetime.timedelta(seconds=30)
+        req = Requester()
+        req.get('http://stat.gibdd.ru')
+        log("Spawned worker...")
+
+        while True:
+                card = queue1.get()
+                if card.last_retry and datetime.datetime.now() - delta < card.last_retry:
+                        if card.retry_count > 20:
+                                queue4.put(card)
+                                continue
+                        time.sleep(0.5)
+                        queue1.put(card)
+                        continue
+
+                if card == 'DONE':
+                        queue1.put('DONE')
+                        log('reader1 done')
+                        break
+
+                card_new = get_codes(req, card)
+
+                if card_new == 500:
+                        card.last_retry = datetime.datetime.now()
+                        card.retry_count += 1
+                        queue1.put(card)
+                        log('Card ' + card.dump() + ' failed')
+                        continue
+
+                if card_new == 503:
+                        queue1.put(card)
+                        log('Service is down')
+                        time.sleep(180)
+                        continue
+
+                if card_new.pdf_code == '' or card_new.xls_code == '':
+                        queue4.put(card_new)
+                        continue
+
+                log(card_new.dump() + ' got codes')
+                card_new.last_retry = None
+                queue2.put(card_new)
+
+def reader2(queue2, queue3):
+        delta = datetime.timedelta(seconds=30)
+        req = Requester()
+        req.get('http://stat.gibdd.ru')
+        log("Spawned worker...")
+
+        while True:
+                card = queue2.get()
+
+                if card.last_retry and datetime.datetime.now() - delta < card.last_retry:
+                        time.sleep(0.5)
+                        queue2.put(card)
+                        continue
+
+                if card == 'DONE':
+                        queue2.put('DONE')
+                        log('reader2 done')
+                        break
+
+                card_new = download(req, card)
+
+                if card_new == 500:
+                        card.last_retry = datetime.datetime.now()
+                        queue2.put(card)
+                        log('Card ' + card.dump() + ' failed')
+                        continue
+
+                if card_new == 503:
+                        queue1.put(card)
+                        log('Service is down')
+                        time.sleep(180)
+                        continue
+
+                log(card.dump() + ' downloaded')
+                card_new.last_retry = None
+                queue3.put(card_new)
+
+def reader3(queue3, queue4):
+        log("Spawned worker...")
+
+
+        folder_name = 'pic'
+
+
+        while True:
+                card = queue3.get()
+                if card == 'DONE':
+                        queue3.put('DONE')
+                        log('reader3 done')
+                        break
+                subprocess.call(['pdfimages', '-png', './dtpdata/raw/' + card.dump() + '.pdf' ,'./dtpdata/' + folder_name + '/'])
+                book = xlrd.open_workbook('/opt/data/DTP_AVAR/py/dtpdata/raw/' + card.dump() + '.xls')
+                names = []
+                for index in range(book.nsheets):
+                        sheet = book.sheet_by_index(index)
+                        date = sheet.cell_value(2, 1)
+                        time = sheet.cell_value(2, 3)
+                        lat = sheet.cell_value(3, 1)
+                        lon = sheet.cell_value(3, 3)
+                        name = date.replace('.', '-') + '_' + time.replace(':', '-') + '_' + lat.replace('.', '-') + '_' + lon.replace('.', '-')
+                        names.append(name)
+
+                count = 2
+                for name in names:
+                        subprocess.call(['mv', '--', './dtpdata/' + folder_name + '/-' + str(count).zfill(3) + '.png', './dtpdata/' + folder_name + '/' + name + '.png'])
+                        count += 1
+                log(card.dump() + ' images extracted')
+                queue4.put(card)
+
+def ender(queue4, cards_q, codes_q, files_q, amount):
+        complete_card = 0
+        while True:
+                try:
+                        card = queue4.get()
+                except:
+                        continue
+                complete_card += 1
+                with open('complete.txt', 'a') as f:
+                        f.write(card.dump() + '\n')
+                log(str(complete_card) + ' of ' + str(amount))
+                if complete_card == amount:
+                        cards_q.put('DONE')
+                        codes_q.put('DONE')
+                        files_q.put('DONE')
+                        break
+
+def writer(queue):
+
+        def time2str(date1, date2):
+                return [str(date1.day).zfill(2) + '.' + str(date1.month).zfill(2) + '.' + str(date1.year), str(date2.day).zfill(2) + '.' + str(date2.month).zfill(2) + '.' + str(date2.year)]
+
+        with open('complete.txt') as f:
+                complete_set = set(f.read().split('\n'))
+
+        dates = []
+        end = datetime.date.today()
+        month = end.month - 1
+        date1 = datetime.date(year=2015, month=1, day=1)
+        # if month > 0:
+        #       date1 = datetime.date(year=end.year, month=month, day=1)
+        # else:
+        #       date1 = datetime.date(year=end.year - 1, month=12, day=1)
+        delta = datetime.timedelta(days=14)
+
+        while True:
+                date2 = date1 + delta
+                if date2 > end:
+                        dates.append(time2str(date1, end))
+                        break
+                dates.append(time2str(date1, date2))
+                date1 = date2
+
+        count = 0
+
+        with open('regs.txt', 'r') as regions_raw:
+                regs = regions_raw.read().strip().split('\n')
+
+        for reg in regs:
+                for date in dates:
+                        card = Card(reg, date[0], date[1])
+                        if card.dump() not in complete_set:
+                                queue.put(Card(reg, date[0], date[1]))
+                                count += 1
+
+        return count
+
+CODE_WORKERS_AMOUNT = 4
+DOWNLOAD_WORKERS_AMOUNT = 4
+EXTRACT_WORKERS_AMOUNT = 1
+CARDS_AMOUNT =  0
+
+if __name__=='__main__':
+        cards_q = Queue()
+        codes_q = Queue()
+        files_q = Queue()
+        done_q = Queue()
+
+        _start = time.time()
+        CARDS_AMOUNT = writer(cards_q)
+
+        processes = []
+        for _ in range(CODE_WORKERS_AMOUNT):
+                reader_p1 = Process(target=reader1, args=((cards_q),(codes_q),(done_q)))
+                reader_p1.daemon = True
+                reader_p1.start()
+                processes.append(reader_p1)
+
+        for _ in range(DOWNLOAD_WORKERS_AMOUNT):
+                reader_p2 = Process(target=reader2, args=((codes_q),(files_q)))
+                reader_p2.daemon = True
+                reader_p2.start()
+                processes.append(reader_p2)
+
+        for _ in range(EXTRACT_WORKERS_AMOUNT):
+                reader_p3 = Process(target=reader3, args=((files_q),(done_q)))
+                reader_p3.daemon = True
+                reader_p3.start()
+                processes.append(reader_p3)
+
+        ender_p = Process(target=ender, args=((done_q), (cards_q), (codes_q), (files_q), (CARDS_AMOUNT)))
+        ender_p.daemon = True
+        ender_p.start()
+        processes.append(ender_p)
+
+        for reader_p in processes:
+                reader_p.join()
+
+        log("Sending {0} numbers to Queue() took {1} seconds".format(count, (time.time() - _start)))
