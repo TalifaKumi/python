@@ -1,0 +1,42 @@
+ cat kr_fs.py
+import inspect
+import time
+import sys
+sys.path.append("/opt/data/CSVSQL")
+#import pscsvsql
+import pymongo
+import gridfs
+import psycopg2
+
+con = psycopg2.connect(
+  database="SKDF",
+  user="skdfadmin",
+  password="...",
+  host="192.168.10.8",
+  port="5433"
+)
+
+print("Database opened successfully")
+
+#sql = pscsvsql.CSVSQL()
+client = pymongo.MongoClient('192.168.10.175',
+                                                         username='skdfAdmin',
+                                                         password='....')
+db = client.get_database('skdfFiles')
+fs = gridfs.GridFS(db)
+cur = con.cursor()
+cur.execute('SELECT id, num, images as pdfpath FROM etl.kr_result_jpg where images IS NOT NULL ')
+pdfs = cur.fetchall()
+#print (pdfs)
+for id, num, images in pdfs:
+        print (images)
+        images = images.replace('\ufeff', '')
+        fimages = images.split(';')[-1]
+        with open(fimages, 'rb') as f:
+                fname = fimages.split('/')[-1]
+                _id = fs.put(f.read(), filename=fname, metadata={'contentType':'application/jpg'})
+                print(id, num, str(_id))
+                cur.execute('UPDATE etl.kr_result_jpg SET jpg_fs_ids  = %s WHERE id = %s and num = %s', [str(_id), id, num])
+                con.commit()
+
+con.close()
